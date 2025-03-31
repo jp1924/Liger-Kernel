@@ -493,6 +493,7 @@ def create_processor(model_name: str):
 
         fast_tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer_base, **tokenizer_config)
         image_processor = CLIPImageProcessor(**image_processor_config)
+        fast_tokenizer.model_input_names = ["input_ids", "attention_mask"]
 
         return LlavaProcessor(**processor_config, image_processor=image_processor, tokenizer=fast_tokenizer)
 
