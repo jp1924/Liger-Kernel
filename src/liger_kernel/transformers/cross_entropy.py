@@ -18,6 +18,9 @@ class LigerCrossEntropyLoss(torch.nn.Module):
         return_z_loss: bool = False,
         return_token_accuracy: bool = False,
         return_predicted_tokens: bool = False,
+        use_eaft: bool = False,
+        eaft_alpha: float = 1.0,
+        eaft_topk: int = 20,
     ):
         super().__init__()
         assert (label_smoothing >= 0) and (label_smoothing <= 1), (
@@ -38,6 +41,9 @@ class LigerCrossEntropyLoss(torch.nn.Module):
         self.return_z_loss = return_z_loss
         self.return_token_accuracy = return_token_accuracy
         self.return_predicted_tokens = return_predicted_tokens
+        self.use_eaft = use_eaft
+        self.eaft_alpha = eaft_alpha
+        self.eaft_topk = eaft_topk
 
     def forward(self, _input: torch.Tensor, target: torch.Tensor):
         loss, z_loss, token_accuracy, predicted_tokens = LigerCrossEntropyFunction.apply(
@@ -52,6 +58,9 @@ class LigerCrossEntropyLoss(torch.nn.Module):
             self.return_z_loss,
             self.return_token_accuracy,
             self.return_predicted_tokens,
+            self.use_eaft,
+            self.eaft_alpha,
+            self.eaft_topk,
         )
         if not self.return_z_loss and not self.return_token_accuracy and not self.return_predicted_tokens:
             return loss

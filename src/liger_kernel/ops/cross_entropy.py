@@ -1,16 +1,13 @@
 import operator
-
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from liger_kernel.ops.utils import compare_version
-from liger_kernel.ops.utils import element_mul_kernel
-from liger_kernel.ops.utils import is_hip
-from liger_kernel.utils import infer_device
-from liger_kernel.utils import is_npu_available
+from liger_kernel.ops.utils import compare_version, element_mul_kernel, is_hip
+from liger_kernel.utils import infer_device, is_npu_available
+
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
     try:
@@ -129,7 +126,9 @@ def liger_cross_entropy_kernel(
     m = float("-inf")  # m is the max value. use the notation from the paper
     d = 0.0  # d is the sum. use the notation from the paper
     argmax_idx = 0  # Track the index of the maximum value for token accuracy / predicted tokens computation
-    ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
+    ori_X_y = tl.load(X_ptr + y).cast(
+        tl.float32
+    )  # we need to store the original value of X_y for the loss calculation
     if HAS_SOFTCAPPING:
         ori_X_y = softcap * tanh(ori_X_y / softcap)
 
@@ -323,6 +322,9 @@ def cross_entropy_forward(
     return_z_loss,
     return_token_accuracy=False,
     return_predicted_tokens=False,
+    use_eaft=False,
+    eaft_alpha=1.0,
+    eaft_topk=20,
 ):
     assert isinstance(return_z_loss, bool), f"return_z_loss must be True or False. Got: {return_z_loss}"
     assert isinstance(return_token_accuracy, bool), (
@@ -331,6 +333,7 @@ def cross_entropy_forward(
     assert isinstance(return_predicted_tokens, bool), (
         f"return_predicted_tokens must be True or False. Got: {return_predicted_tokens}"
     )
+    assert isinstance(use_eaft, bool), f"use_eaft must be True or False. Got: {use_eaft}"
 
     BT, V = _input.shape
     n_rows = BT
@@ -371,6 +374,23 @@ def cross_entropy_forward(
         _input = _input.contiguous()
     if target.stride(-1) != 1:
         target = target.contiguous()
+
+    # Compute EAFT weights before the kernel modifies _input in-place
+    eaft_weights = None
+    if use_eaft:
+        with torch.no_grad():
+            logits_for_eaft = _input.detach().clone()
+            if softcap is not None:
+                logits_for_eaft = softcap * torch.tanh(logits_for_eaft / softcap)
+            k = min(eaft_topk, V)
+            topk_val, _ = torch.topk(logits_for_eaft, k=k, dim=-1)
+            logsumexp_topk = torch.logsumexp(topk_val, dim=-1, keepdim=True)
+            log_probs_topk = topk_val - logsumexp_topk
+            probs_topk = torch.exp(log_probs_topk)
+            entropy_approx = -(probs_topk * log_probs_topk).sum(dim=-1)
+            entropy_term = entropy_approx / 3.0
+            eaft_weights = torch.pow(entropy_term, eaft_alpha)
+            eaft_weights = torch.where(target_mask, eaft_weights, torch.zeros_like(eaft_weights))
 
     # Here we use a trick to store X_ptr gradient in X_ptr so we can save memory
     liger_cross_entropy_kernel[(n_rows,)](
@@ -416,6 +436,15 @@ def cross_entropy_forward(
         z_loss = z_loss_1d if return_z_loss else None
         token_accuracy = token_accuracy_1d if return_token_accuracy else None
     else:
+        # Apply EAFT weights before reduction
+        if use_eaft and eaft_weights is not None:
+            loss_1d = loss_1d * eaft_weights
+            if return_z_loss:
+                z_loss_1d = z_loss_1d * eaft_weights
+            # Scale gradients stored in _input
+            if _input.requires_grad or True:  # gradients are stored in _input
+                _input = _input * eaft_weights.unsqueeze(-1)
+
         loss = torch.sum(loss_1d)
         z_loss = torch.sum(z_loss_1d) if return_z_loss else None
         # For accuracy, we compute the mean across all non-ignored tokens
@@ -473,6 +502,9 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
         return_z_loss: bool = False,
         return_token_accuracy: bool = False,
         return_predicted_tokens: bool = False,
+        use_eaft: bool = False,
+        eaft_alpha: float = 1.0,
+        eaft_topk: int = 20,
     ):
         """
         The forward pass of the Liger Cross Entropy loss.
@@ -508,6 +540,9 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
             return_z_loss,
             return_token_accuracy,
             return_predicted_tokens,
+            use_eaft,
+            eaft_alpha,
+            eaft_topk,
         )
         # TODO: investigation
         # If we don't detach the _input tensor, the memory will double
@@ -555,4 +590,7 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # use_eaft
+            None,  # eaft_alpha
+            None,  # eaft_topk
         )

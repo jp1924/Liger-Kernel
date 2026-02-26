@@ -2,11 +2,9 @@ import torch
 import triton
 
 from liger_kernel.ops.cross_entropy import liger_cross_entropy_kernel
-from liger_kernel.ops.utils import amp_custom_bwd
-from liger_kernel.ops.utils import amp_custom_fwd
-from liger_kernel.ops.utils import element_mul_kernel
-from liger_kernel.ops.utils import is_hip
+from liger_kernel.ops.utils import amp_custom_bwd, amp_custom_fwd, element_mul_kernel, is_hip
 from liger_kernel.utils import infer_device
+
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
@@ -30,6 +28,9 @@ def fused_linear_cross_entropy_forward(
     use_token_scaling=False,
     return_token_accuracy=False,
     return_predicted_tokens=False,
+    use_eaft=False,
+    eaft_alpha=1.0,
+    eaft_topk=20,
 ):
     assert isinstance(return_z_loss, bool), f"return_z_loss must be True or False. Got: {return_z_loss}"
     assert isinstance(return_token_accuracy, bool), (
@@ -38,6 +39,8 @@ def fused_linear_cross_entropy_forward(
     assert isinstance(return_predicted_tokens, bool), (
         f"return_predicted_tokens must be True or False. Got: {return_predicted_tokens}"
     )
+    assert isinstance(use_eaft, bool), f"use_eaft must be True or False. Got: {use_eaft}"
+    assert not (use_token_scaling and use_eaft), "use_token_scaling and use_eaft cannot both be True. Choose one."
     device = _input.device
 
     input_requires_grad = _input.requires_grad
@@ -137,6 +140,30 @@ def fused_linear_cross_entropy_forward(
             # Store the scaling factors
             scaling_factors = pred_probs.detach()  # Detach to ensure no gradient flow
 
+        # Compute EAFT (Entropy-Adaptive Fine-Tuning) scaling if needed
+        if use_eaft:
+            logits_for_eaft = logits_chunk.detach().clone()
+            if softcap is not None:
+                logits_for_eaft = softcap * torch.tanh(logits_for_eaft / softcap)
+
+            valid_target_mask = target_chunk != ignore_index
+
+            # Compute approximate entropy using top-k logits
+            k = min(eaft_topk, V)
+            topk_val, _ = torch.topk(logits_for_eaft, k=k, dim=-1)
+            logsumexp_topk = torch.logsumexp(topk_val, dim=-1, keepdim=True)
+            log_probs_topk = topk_val - logsumexp_topk
+            probs_topk = torch.exp(log_probs_topk)
+            entropy_approx = -(probs_topk * log_probs_topk).sum(dim=-1)
+
+            # Adaptive weight: (entropy / 3.0) ^ alpha
+            entropy_term = entropy_approx / 3.0
+            adaptive_weight = torch.pow(entropy_term, eaft_alpha)
+
+            # Zero out weights for ignored targets
+            adaptive_weight = torch.where(valid_target_mask, adaptive_weight, torch.zeros_like(adaptive_weight))
+            scaling_factors = adaptive_weight.detach()
+
         # unreduced loss
         loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
         z_loss_1d_slice = z_loss_1d[start_idx:end_idx] if return_z_loss else None
@@ -184,8 +211,8 @@ def fused_linear_cross_entropy_forward(
             num_warps=32 if not is_hip() else 16,
         )
 
-        # Apply token scaling if requested
-        if use_token_scaling:
+        # Apply token scaling or EAFT scaling if requested
+        if use_token_scaling or use_eaft:
             loss_1d_slice = loss_1d_slice * scaling_factors
             if return_z_loss:
                 z_loss_1d_slice = z_loss_1d_slice * scaling_factors
@@ -199,8 +226,8 @@ def fused_linear_cross_entropy_forward(
             predicted_tokens_1d[start_idx:end_idx] = predicted_tokens_1d_slice
         grad_logits_chunk = logits_chunk  # chunk_size x V
 
-        # Apply token scaling to gradients if requested
-        if use_token_scaling:
+        # Apply token scaling or EAFT scaling to gradients if requested
+        if use_token_scaling or use_eaft:
             # Expand scaling factors to match gradient dimensions
             scaling_factors_expanded = scaling_factors.unsqueeze(-1)  # chunk_size x 1
             grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
@@ -311,6 +338,9 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         use_token_scaling: bool = False,
         return_token_accuracy: bool = False,
         return_predicted_tokens: bool = False,
+        use_eaft: bool = False,
+        eaft_alpha: float = 1.0,
+        eaft_topk: int = 20,
     ):
         """
         Fusing the last linear layer with cross-entropy loss
@@ -336,6 +366,11 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             Default: False.
         return_token_accuracy (bool): When `return_token_accuracy` is `True`, computes and returns per-token accuracy without materializing logits. Default: `False`
         return_predicted_tokens (bool): When `return_predicted_tokens` is `True`, returns per-token predicted class indices (argmax) without materializing logits. Default: `False`
+        use_eaft (bool): When True, applies Entropy-Adaptive Fine-Tuning (EAFT) weighting.
+            Each token's loss is scaled by an adaptive weight based on top-k entropy of the logits distribution.
+            Default: False.
+        eaft_alpha (float): Exponent for the EAFT adaptive weight. Default: 1.0.
+        eaft_topk (int): Number of top logits to use for entropy approximation in EAFT. Default: 20.
         """
 
         loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias = (
@@ -355,6 +390,9 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
                 use_token_scaling=use_token_scaling,
                 return_token_accuracy=return_token_accuracy,
                 return_predicted_tokens=return_predicted_tokens,
+                use_eaft=use_eaft,
+                eaft_alpha=eaft_alpha,
+                eaft_topk=eaft_topk,
             )
         )
         # downcast to dtype and store for backward
@@ -397,4 +435,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             None,  # use_token_scaling
             None,  # return_token_accuracy
             None,  # return_predicted_tokens
+            None,  # use_eaft
+            None,  # eaft_alpha
+            None,  # eaft_topk
         )

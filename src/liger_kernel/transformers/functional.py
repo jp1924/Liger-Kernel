@@ -3,26 +3,28 @@ from typing import Optional
 
 import torch
 
-from liger_kernel.ops import LigerCrossEntropyFunction
-from liger_kernel.ops import LigerDyTFunction
-from liger_kernel.ops import LigerFusedAddRMSNormFunction
-from liger_kernel.ops import LigerFusedLinearCrossEntropyFunction
-from liger_kernel.ops import LigerFusedLinearJSDFunction
-from liger_kernel.ops import LigerFusedNeighborhoodAttentionFunction
-from liger_kernel.ops import LigerGELUMulFunction
-from liger_kernel.ops import LigerGroupNormFunction
-from liger_kernel.ops import LigerJSDFunction
-from liger_kernel.ops import LigerKLDivLossFunction
-from liger_kernel.ops import LigerLayerNormFunction
-from liger_kernel.ops import LigerMultiTokenAttentionFunction
-from liger_kernel.ops import LigerPolyNormFunction
-from liger_kernel.ops import LigerQwen2VLMRopeFunction
-from liger_kernel.ops import LigerRMSNormFunction
-from liger_kernel.ops import LigerRopeFunction
-from liger_kernel.ops import LigerSiLUMulFunction
-from liger_kernel.ops import LigerSoftmaxFunction
-from liger_kernel.ops import LigerSparsemaxFunction
-from liger_kernel.ops import LigerTVDLossFunction
+from liger_kernel.ops import (
+    LigerCrossEntropyFunction,
+    LigerDyTFunction,
+    LigerFusedAddRMSNormFunction,
+    LigerFusedLinearCrossEntropyFunction,
+    LigerFusedLinearJSDFunction,
+    LigerFusedNeighborhoodAttentionFunction,
+    LigerGELUMulFunction,
+    LigerGroupNormFunction,
+    LigerJSDFunction,
+    LigerKLDivLossFunction,
+    LigerLayerNormFunction,
+    LigerMultiTokenAttentionFunction,
+    LigerPolyNormFunction,
+    LigerQwen2VLMRopeFunction,
+    LigerRMSNormFunction,
+    LigerRopeFunction,
+    LigerSiLUMulFunction,
+    LigerSoftmaxFunction,
+    LigerSparsemaxFunction,
+    LigerTVDLossFunction,
+)
 
 
 @dataclass
@@ -49,6 +51,9 @@ def liger_cross_entropy(
     return_z_loss: bool = False,
     return_token_accuracy: bool = False,
     return_predicted_tokens: bool = False,
+    use_eaft: bool = False,
+    eaft_alpha: float = 1.0,
+    eaft_topk: int = 20,
 ):
     loss, z_loss, token_accuracy, predicted_tokens = LigerCrossEntropyFunction.apply(
         input,
@@ -62,6 +67,9 @@ def liger_cross_entropy(
         return_z_loss,
         return_token_accuracy,
         return_predicted_tokens,
+        use_eaft,
+        eaft_alpha,
+        eaft_topk,
     )
 
     if not return_z_loss and not return_token_accuracy and not return_predicted_tokens:
@@ -88,6 +96,9 @@ def liger_fused_linear_cross_entropy(
     use_token_scaling: bool = False,
     return_token_accuracy: bool = False,
     return_predicted_tokens: bool = False,
+    use_eaft: bool = False,
+    eaft_alpha: float = 1.0,
+    eaft_topk: int = 20,
 ):
     loss, z_loss, token_accuracy, predicted_tokens = LigerFusedLinearCrossEntropyFunction.apply(
         input,
@@ -105,6 +116,9 @@ def liger_fused_linear_cross_entropy(
         use_token_scaling,
         return_token_accuracy,
         return_predicted_tokens,
+        use_eaft,
+        eaft_alpha,
+        eaft_topk,
     )
 
     if not return_z_loss and not return_token_accuracy and not return_predicted_tokens:
